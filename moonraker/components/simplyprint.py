@@ -55,8 +55,7 @@ class SimplyPrint(Subscribable):
         self.is_closing = False
         self.test = config.get("sp_test", True)
         self.ws: Optional[WebSocketClientConnection] = None
-        self.reported_state = "offline"
-        self.reported_temps: Dict[str, Any] = {}
+        self.cache = ReportCache()
         self.last_received_temps: Dict[str, float] = {}
         self.last_temp_update_time: float = 0.
         self.last_err_log_time: float = 0.
@@ -67,10 +66,14 @@ class SimplyPrint(Subscribable):
         database.register_local_namespace("simplyprint", forbidden=True)
         self.spdb = database.wrap_namespace("simplyprint")
         self.sp_info = self.spdb.as_dict()
-        # TODO: For testing we are initializing connectd to True.  This
-        # should be be set to False in the future
-        self.connected = True
-        self._set_ws_url()
+        self.connected = False
+        # XXX: The configurable connect url is for testing,
+        # remove before release
+        connect_url = config.get("url", None)
+        if connect_url is not None:
+            self.connect_url = connect_url
+        else:
+            self._set_ws_url()
 
         # Register State Events
         self.server.register_event_handler(
@@ -144,6 +147,9 @@ class SimplyPrint(Subscribable):
             if self.reconnect_hdl is None:
                 self.reconnect_hdl = self.eventloop.delay_callback(
                     5., self._do_connect)
+            if self.keepalive_hdl is not None:
+                self.keepalive_hdl.cancel()
+                self.keepalive_hdl = None
 
     def _process_message(self, msg: str) -> None:
         self._logger.info(f"received: {msg}")
@@ -265,21 +271,21 @@ class SimplyPrint(Subscribable):
     def _on_klippy_disconnected(self) -> None:
         self._update_state("offline")
         self._send_sp("connection", "disconnected")
-        self.reported_temps = {}
+        self.cache.temps = {}
         self.printer_status = {}
 
     def _on_print_start(self, *args) -> None:
         # inlcludes started and resumed events
         self._update_state("printing")
         self._send_sp("print_started", None)
+        # TODO: send filename and filament info
+        # TODO: start polling for job info
 
     def _on_print_paused(self, *args) -> None:
         self._update_state("paused")
         self._send_sp("print_paused", None)
 
     def _on_print_cancelled(self, *args) -> None:
-        # TODO: Update State (translate from Klippy), send
-        # print_cancelled event
         self._update_state_from_klippy()
         self._send_sp("print_cancelled", None)
 
@@ -299,38 +305,39 @@ class SimplyPrint(Subscribable):
 
     def _update_temps(self, new_status: Dict[str, Dict[str, Any]]) -> None:
         cur_time = self.eventloop.get_loop_time()
-        if cur_time - self.last_temp_update_time < 1.:
-            return
         temp_data: Dict[str, List[int]] = {}
-        for heater, vals in new_status.items():
-            if heater == "heater_bed":
+        for printer_obj, vals in new_status.items():
+            self.printer_status[printer_obj].update(vals)
+            if cur_time - self.last_temp_update_time < 1.:
+                continue
+            if printer_obj == "heater_bed":
                 key = "bed"
-            elif heater.startswith("extruder"):
+            elif printer_obj.startswith("extruder"):
                 key = "tool"
-                postfix = heater[8:]
+                postfix = printer_obj[8:]
                 if postfix.isdigit():
                     key += postfix
                 else:
                     key += "0"
             else:
                 continue
-            self.printer_status[heater].update(vals)
-            reported_temp = self.printer_status[heater]["temperature"]
+            reported_temp = self.printer_status[printer_obj]["temperature"]
             ret = [int(reported_temp + .5)]
-            target = int(self.printer_status[heater]["target"] + .5)
+            target = int(self.printer_status[printer_obj]["target"] + .5)
             if target:
                 ret.append(target)
-            last_temps = self.reported_temps.get(key, [])
-            if (
-                len(ret) == len(last_temps) and
-                key in self.last_received_temps
-            ):
-                last_reported = self.last_received_temps[key]
-                if abs(reported_temp - last_reported) < .5:
-                    self.last_received_temps.pop(key)
+            last_temps = self.cache.temps.get(key, [])
+            if len(ret) == len(last_temps):
+                if key in self.last_received_temps:
+                    last_reported = self.last_received_temps[key]
+                    if abs(reported_temp - last_reported) < .75:
+                        self.last_received_temps.pop(key)
+                        continue
+                if ret[0] == last_temps[0]:
+                    self.last_received_temps[key] = reported_temp
                     continue
             self.last_received_temps[key] = reported_temp
-            self.reported_temps[key] = ret
+            self.cache.temps[key] = ret
             temp_data[key] = ret
         if not temp_data:
             return
@@ -348,9 +355,9 @@ class SimplyPrint(Subscribable):
         self._update_state(sp_state)
 
     def _update_state(self, new_state: str) -> None:
-        if self.reported_state == new_state:
+        if self.cache.state == new_state:
             return
-        self.reported_state = new_state
+        self.cache.state = new_state
         self._send_sp("state_change", {"new": new_state})
 
     async def _send_printer_data(self):
@@ -387,35 +394,40 @@ class SimplyPrint(Subscribable):
 
     def _send_firmware_data(self):
         kinfo = self.server.get_klippy_info()
-        if not kinfo:
+        if "software_version" not in kinfo:
             return
-        fimrware_date: str = ""
+        firmware_date: str = ""
         # Approximate the firmware "date" using the last modified
         # time of the Klippy source folder
         kpath = pathlib.Path(kinfo["klipper_path"]).joinpath("klippy")
         if kpath.is_dir():
             mtime = kpath.stat().st_mtime
-            fimrware_date = time.asctime(time.gmtime(mtime))
-        version: str = kinfo["sofware_version"]
+            firmware_date = time.asctime(time.gmtime(mtime))
+        version: str = kinfo["software_version"]
         unsafe = version.endswith("-dirty") or version == "?"
         if unsafe:
             version = version.rsplit("-", 1)[0]
         fw_info = {
             "firmware": "Klipper",
             "firmware_version": version,
-            "firmware_date": fimrware_date,
+            "firmware_date": firmware_date,
             "firmware_link": "https://github.com/Klipper3d/klipper",
             "firmware_unsafe": unsafe
         }
+        if fw_info == self.cache.firmware_info:
+            return
+        self.cache.firmware_info = fw_info
         self._send_sp("firmware_data", fw_info)
 
     def _push_initial_state(self):
         # TODO: This method is called after SP is connected
         # and ready to receive state.  We need to determine
         # if we should
-        self._send_sp("state_change", {"new": self.reported_state})
-        if self.reported_temps:
-            self._send_sp("temps", self.reported_temps)
+        self._send_sp("state_change", {"new": self.cache.state})
+        if self.cache.temps:
+            self._send_sp("temps", self.cache.temps)
+        if self.cache.firmware_info:
+            self._send_sp("firmware_data", self.cache.firmware_info)
         self.eventloop.create_task(self._send_printer_data())
 
     def _send_sp(self, evt_name: str, data: Any) -> asyncio.Future:
@@ -471,6 +483,12 @@ class SimplyPrint(Subscribable):
             self.keepalive_hdl = None
         if self.ws is not None:
             self.ws.close()
+
+class ReportCache:
+    def __init__(self) -> None:
+        self.state = "offline"
+        self.temps: Dict[str, Any] = {}
+        self.firmware_info: Dict[str, Any] = {}
 
 def load_component(config: ConfigHelper) -> SimplyPrint:
     return SimplyPrint(config)
