@@ -107,6 +107,10 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "job_state:cancelled", self._on_print_cancelled)
         self.server.register_event_handler(
+            "klippy_apis:pause_requested", self._on_pause_requested)
+        self.server.register_event_handler(
+            "klippy_apis:cancel_requested", self._on_cancel_requested)
+        self.server.register_event_handler(
             "websockets:websocket_identified",
             self._on_websocket_identified)
         self.server.register_event_handler(
@@ -371,6 +375,14 @@ class SimplyPrint(Subscribable):
     def _on_print_standby(self, *args) -> None:
         self._update_state_from_klippy()
         self.cache.job_info = {}
+
+    def _on_pause_requested(self) -> None:
+        if self.cache.state == "printing":
+            self._update_state("pausing")
+
+    def _on_cancel_requested(self) -> None:
+        if self.cache.state in ["printing", "paused", "pausing"]:
+            self._update_state("cancelling")
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         for printer_obj, vals in status.items():
