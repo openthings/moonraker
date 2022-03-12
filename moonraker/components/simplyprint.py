@@ -137,6 +137,7 @@ class SimplyPrint(Subscribable):
             try:
                 self.ws = await tornado.websocket.websocket_connect(
                     self.connect_url, connect_timeout=5.,
+                    ping_interval=15., ping_timeout=45.,
                     on_message_callback=self._on_ws_message)
             except Exception:
                 curtime = self.eventloop.get_loop_time()
