@@ -54,6 +54,8 @@ class SimplyPrint(Subscribable):
         self.eventloop = self.server.get_event_loop()
         self.job_state: JobState
         self.job_state = self.server.lookup_component("job_state")
+        self.klippy_apis: KlippyAPI
+        self.klippy_apis = self.server.lookup_component("klippy_apis")
         self.is_closing = False
         self.test = config.get("sp_test", True)
         self.ws: Optional[WebSocketClientConnection] = None
@@ -72,6 +74,7 @@ class SimplyPrint(Subscribable):
         database.register_local_namespace("simplyprint", forbidden=True)
         self.spdb = database.wrap_namespace("simplyprint")
         self.sp_info = self.spdb.as_dict()
+        self.gc_resp_counter = 0
         self.connected = False
         self.is_set_up = False
         # XXX: The configurable connect url is for testing,
@@ -97,7 +100,7 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "job_state:paused", self._on_print_paused)
         self.server.register_event_handler(
-            "job_state:resumed", self._on_print_start)
+            "job_state:resumed", self._on_print_resumed)
         self.server.register_event_handler(
             "job_state:standby", self._on_print_standby)
         self.server.register_event_handler(
@@ -116,6 +119,8 @@ class SimplyPrint(Subscribable):
         self.server.register_event_handler(
             "websockets:websocket_removed",
             self._on_websocket_removed)
+        self.server.register_event_handler(
+            "server:gcode_response", self._on_gcode_response)
 
         # XXX: The call below is for dev, remove before release
         self._setup_simplyprint_logging()
@@ -221,6 +226,14 @@ class SimplyPrint(Subscribable):
                 return
             logging.info(f"SimplyPrint Printer ID Received: {name}")
             self._save_item("printer_name", name)
+        elif event == "gcode":
+            if data is None:
+                self._logger.info(f"Invalid message, no data")
+                return
+            script_list = data.get("list", [])
+            if script_list:
+                script = "\n".join(script_list)
+                self.eventloop.create_task(self._run_gcode(script))
         else:
             # TODO: It would be good for the backend to send an
             # event indicating that it is ready to recieve printer
@@ -243,17 +256,21 @@ class SimplyPrint(Subscribable):
                 self.is_set_up = True
                 self.connect_url = f"{ep}/{printer_id}/{token}"
 
+    async def _run_gcode(self, script: str) -> None:
+        self.gc_resp_counter += 1
+        await self.klippy_apis.run_gcode(script, None)
+        self.gc_resp_counter -= 1
+
     async def _on_klippy_ready(self):
         last_stats: Dict[str, Any] = self.job_state.get_last_stats()
         if last_stats["state"] == "printing":
             self._update_state("printing")
         else:
             self._update_state("operational")
-        klippy_apis: KlippyAPI = self.server.lookup_component("klippy_apis")
-        query: Dict[str] = await klippy_apis.query_objects(
+        query: Dict[str] = await self.klippy_apis.query_objects(
             {"heaters": None}, None)
         sub_objs = {
-            "virtual_sdcard": ["progress"],
+            "display_status": ["progress"],
             "bed_mesh": ["mesh_matrix", "mesh_min", "mesh_max"]
         }
         if query is not None:
@@ -358,6 +375,9 @@ class SimplyPrint(Subscribable):
         self._send_sp("job_info", {"paused": True})
         self.cache.job_info = {}
 
+    def _on_print_resumed(self, *args) -> None:
+        self._update_state("printing")
+
     def _on_print_cancelled(self, *args) -> None:
         self._update_state_from_klippy()
         self._send_sp("job_info", {"cancelled": True})
@@ -384,6 +404,10 @@ class SimplyPrint(Subscribable):
     def _on_cancel_requested(self) -> None:
         if self.cache.state in ["printing", "paused", "pausing"]:
             self._update_state("cancelling")
+
+    def _on_gcode_response(self, response: str):
+        if self.gc_resp_counter:
+            self._send_sp("gcode_response", {"response": response})
 
     def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         for printer_obj, vals in status.items():
@@ -413,8 +437,8 @@ class SimplyPrint(Subscribable):
                 time_left != last_time_left
             ):
                 job_info["time"] = time_left
-        if "virtual_sdcard" in self.printer_status:
-            progress = self.printer_status["virtual_sdcard"]["progress"]
+        if "display_status" in self.printer_status:
+            progress = self.printer_status["display_status"]["progress"]
             pct_prog = int(progress * 100 + .5)
             if pct_prog != self.cache.job_info.get("progress", -1):
                 job_info["progress"] = int(progress * 100 + .5)
