@@ -61,7 +61,6 @@ class SimplyPrint(Subscribable):
         self.ws: Optional[WebSocketClientConnection] = None
         self.cache = ReportCache()
         self.last_received_temps: Dict[str, float] = {}
-        self.last_temp_update_time: float = 0.
         self.last_err_log_time: float = 0.
         self.printer_status: Dict[str, Dict[str, Any]] = {}
         self.heaters: Dict[str, str] = {}
@@ -111,6 +110,8 @@ class SimplyPrint(Subscribable):
             "job_state:cancelled", self._on_print_cancelled)
         self.server.register_event_handler(
             "klippy_apis:pause_requested", self._on_pause_requested)
+        self.server.register_event_handler(
+            "klippy_apis:resume_requested", self._on_resume_requested)
         self.server.register_event_handler(
             "klippy_apis:cancel_requested", self._on_cancel_requested)
         self.server.register_event_handler(
@@ -355,19 +356,18 @@ class SimplyPrint(Subscribable):
         # inlcludes started and resumed events
         self._update_state("printing")
         filename = new_stats["filename"]
-        job_info: Dict[str, Any] = {
-            "filename": filename,
-            "started": True
-        }
+        job_info: Dict[str, Any] = {"filename": filename}
         fm: FileManager = self.server.lookup_component("file_manager")
         metadata = fm.get_file_metadata(filename)
         filament: Optional[float] = metadata.get("filament_total")
         if filament is not None:
-            job_info["filament"] = filament
+            job_info["filament"] = round(filament)
         est_time = self.cache.metadata.get("estimated_time")
         if est_time is not None:
             job_info["time"] = est_time
         self.cache.metadata = metadata
+        self.cache.job_info.update(job_info)
+        job_info["started"] = True
         self._send_sp("job_info", job_info)
 
     def _on_print_paused(self, *args) -> None:
@@ -400,6 +400,10 @@ class SimplyPrint(Subscribable):
     def _on_pause_requested(self) -> None:
         if self.cache.state == "printing":
             self._update_state("pausing")
+
+    def _on_resume_requested(self) -> None:
+        if self.cache.state == "paused":
+            self._update_state("resuming")
 
     def _on_cancel_requested(self) -> None:
         if self.cache.state in ["printing", "paused", "pausing"]:
@@ -440,14 +444,13 @@ class SimplyPrint(Subscribable):
         if "display_status" in self.printer_status:
             progress = self.printer_status["display_status"]["progress"]
             pct_prog = int(progress * 100 + .5)
-            if pct_prog != self.cache.job_info.get("progress", -1):
+            if pct_prog != self.cache.job_info.get("progress", 0):
                 job_info["progress"] = int(progress * 100 + .5)
         if job_info:
             self.cache.job_info.update(job_info)
             self._send_sp("job_info", job_info)
 
     def _update_temps(self) -> None:
-        cur_time = self.eventloop.get_loop_time()
         temp_data: Dict[str, List[int]] = {}
         for printer_obj, key in self.heaters.items():
             reported_temp = self.printer_status[printer_obj]["temperature"]
@@ -474,7 +477,6 @@ class SimplyPrint(Subscribable):
             self.cache.temps[key] = ret
         if not temp_data:
             return
-        self.last_temp_update_time = cur_time
         if self.is_set_up:
             self._send_sp("temps", temp_data)
 
